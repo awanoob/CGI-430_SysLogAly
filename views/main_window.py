@@ -52,6 +52,9 @@ class LogViewer(QMainWindow):
         
         # 创建停靠窗口
         self.create_dock_widgets()
+        
+        # 新增：创建状态栏，显示PN/SN/版本
+        self.create_status_bar()
     
     def create_menu(self):
         """创建菜单栏"""
@@ -101,6 +104,13 @@ class LogViewer(QMainWindow):
         error_dock = QDockWidget("错误导航")
         error_dock.setWidget(self.error_nav)
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, error_dock)
+    
+    def create_status_bar(self):
+        """创建状态栏，显示设备PN、SN和版本"""
+        status_label = QLabel("PN: 11064738700BA | SN: 4205653 | 版本: 2.5.1")
+        status_label.setObjectName("deviceStatusLabel")
+        status_label.setStyleSheet("QLabel#deviceStatusLabel { padding: 0 8px; }")
+        self.statusBar().addPermanentWidget(status_label)
     
     def open_file(self):
         """打开文件并解析日志"""

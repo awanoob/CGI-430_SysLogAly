@@ -6,7 +6,7 @@ LOG_COLORS = {
     "INFO": QColor(220, 255, 220),
     "WARN": QColor(255, 255, 200),
     "ERROR": QColor(255, 200, 200),
-    "DEBUG": QColor(200, 200, 255),
+    "DEBUG": QColor(225, 225, 225),
     "TRACE": QColor(240, 240, 240),
 }
 

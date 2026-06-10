@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import re
 from typing import Optional
+from datetime import datetime
 
 
 def parse_log_line(line: str):
@@ -85,7 +86,7 @@ def split_boot_sessions(parsed_logs: list[tuple]) -> list[dict]:
             continue
 
         back = marker_idx
-        while back - 1 >= 0 and parsed_logs[back - 1][0].startswith("2023-01-01"):
+        while back - 1 >= 0 and (datetime.strptime(parsed_logs[back][0], "%Y-%m-%d %H:%M:%S:%f") - datetime.strptime(parsed_logs[back - 1][0], "%Y-%m-%d %H:%M:%S:%f")).seconds < 1:
             back -= 1
 
         if back > starts[-1]:

@@ -1,11 +1,12 @@
 """对话框组件"""
 import re
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import QEvent, Qt, pyqtSignal
 
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QCheckBox,
+    QColorDialog,
     QComboBox,
     QDialog,
     QHBoxLayout,
@@ -17,6 +18,7 @@ from PyQt6.QtWidgets import (
     QTextEdit,
     QTableWidget,
     QTableWidgetItem,
+    QSpinBox,
     QVBoxLayout,
 )
 
@@ -38,6 +40,7 @@ class FilterDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("日志筛选")
         self.setMinimumWidth(400)
+        self.setWindowFlag(Qt.WindowType.WindowContextHelpButtonHint, True)
 
         layout = QVBoxLayout()
 
@@ -98,6 +101,200 @@ class FilterDialog(QDialog):
         self.module_edit.clear()
         self.func_edit.clear()
         self.content_edit.clear()
+
+    def show_usage_help(self):
+        """显示筛选表达式用法。"""
+        text = (
+            "内容筛选支持关键字与逻辑运算:\n"
+            "1. 使用 && 表示与，例如: 定位&&成功\n"
+            "2. 使用 || 表示或，例如: ERROR||WARN\n"
+            "3. 空格会按 || 处理，例如: 定位 成功 等价于 定位||成功\n"
+            "4. 双引号内空格不拆分，例如: \"定位 失败\"&&重试\n"
+            "5. 支持混合，例如: \"State Change\"&&gnss||北斗"
+        )
+        QMessageBox.information(self, "筛选说明", text)
+
+    def event(self, event):
+        """拦截标题栏帮助按钮触发，直接弹出筛选说明。"""
+        if event.type() == QEvent.Type.EnterWhatsThisMode:
+            self.show_usage_help()
+            return True
+        return super().event(event)
+
+
+class FilterHintDialog(QDialog):
+    """筛选入口引导提示。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("筛选提示")
+        self.setMinimumWidth(420)
+
+        layout = QVBoxLayout()
+        layout.addWidget(QLabel("可以点击“？”获取筛选说明。"))
+
+        self.dont_show_check = QCheckBox("下次不显示该窗口")
+        layout.addWidget(self.dont_show_check)
+
+        btn_row = QHBoxLayout()
+        ok_btn = QPushButton("知道了")
+        ok_btn.clicked.connect(self.accept)
+        btn_row.addStretch()
+        btn_row.addWidget(ok_btn)
+        layout.addLayout(btn_row)
+
+        self.setLayout(layout)
+
+    def dont_show_again(self):
+        return self.dont_show_check.isChecked()
+
+
+class NotificationSettingsDialog(QDialog):
+    """通知设置。"""
+
+    def __init__(self, guide_enabled=True, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("通知设置")
+        self.setMinimumWidth(420)
+
+        layout = QVBoxLayout()
+        self.guide_check = QCheckBox("开启引导提示")
+        self.guide_check.setChecked(bool(guide_enabled))
+        layout.addWidget(self.guide_check)
+
+        btn_row = QHBoxLayout()
+        save_btn = QPushButton("保存")
+        save_btn.clicked.connect(self.accept)
+        cancel_btn = QPushButton("取消")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addStretch()
+        btn_row.addWidget(save_btn)
+        btn_row.addWidget(cancel_btn)
+        layout.addLayout(btn_row)
+
+        self.setLayout(layout)
+
+    def get_settings(self):
+        return {
+            "guide_enabled": self.guide_check.isChecked(),
+        }
+
+
+class InterfaceSettingsDialog(QDialog):
+    """界面设置。"""
+
+    def __init__(self, tree_bg_color="#ffffff", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("界面设置")
+        self.setMinimumWidth(460)
+        self.current_color = tree_bg_color or "#ffffff"
+
+        layout = QVBoxLayout()
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("日志背景颜色:"))
+        self.color_preview = QLineEdit(self.current_color)
+        self.color_preview.setReadOnly(True)
+        choose_btn = QPushButton("选择颜色")
+        choose_btn.clicked.connect(self.choose_color)
+        row.addWidget(self.color_preview)
+        row.addWidget(choose_btn)
+        layout.addLayout(row)
+
+        btn_row = QHBoxLayout()
+        save_btn = QPushButton("保存")
+        save_btn.clicked.connect(self.accept)
+        cancel_btn = QPushButton("取消")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addStretch()
+        btn_row.addWidget(save_btn)
+        btn_row.addWidget(cancel_btn)
+        layout.addLayout(btn_row)
+
+        self.setLayout(layout)
+
+    def choose_color(self):
+        color = QColorDialog.getColor(parent=self)
+        if color.isValid():
+            self.current_color = color.name()
+            self.color_preview.setText(self.current_color)
+
+    def get_settings(self):
+        return {
+            "tree_bg_color": self.current_color,
+        }
+
+
+class UpdateSettingsDialog(QDialog):
+    """升级设置。"""
+
+    def __init__(
+        self,
+        server_url,
+        channel,
+        timeout_seconds,
+        auto_check_on_startup,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("升级设置")
+        self.setMinimumWidth(520)
+
+        layout = QVBoxLayout()
+
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("升级服务器地址:"))
+        self.server_url_edit = QLineEdit(server_url)
+        self.server_url_edit.setPlaceholderText("例如: http://10.10.166.26:10612")
+        row1.addWidget(self.server_url_edit)
+        layout.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("发布通道:"))
+        self.channel_combo = QComboBox()
+        self.channel_combo.setEditable(True)
+        self.channel_combo.addItems(["stable", "beta"])
+        current_channel = channel.strip() if channel else "stable"
+        idx = self.channel_combo.findText(current_channel)
+        if idx >= 0:
+            self.channel_combo.setCurrentIndex(idx)
+        else:
+            self.channel_combo.setCurrentText(current_channel)
+        row2.addWidget(self.channel_combo)
+        layout.addLayout(row2)
+
+        row3 = QHBoxLayout()
+        row3.addWidget(QLabel("请求超时(秒):"))
+        self.timeout_spin = QSpinBox()
+        self.timeout_spin.setRange(3, 120)
+        self.timeout_spin.setValue(int(timeout_seconds))
+        row3.addWidget(self.timeout_spin)
+        row3.addStretch()
+        layout.addLayout(row3)
+
+        self.auto_check_check = QCheckBox("启动时自动检查升级（静默）")
+        self.auto_check_check.setChecked(bool(auto_check_on_startup))
+        layout.addWidget(self.auto_check_check)
+
+        btn_row = QHBoxLayout()
+        save_btn = QPushButton("保存")
+        save_btn.clicked.connect(self.accept)
+        cancel_btn = QPushButton("取消")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addStretch()
+        btn_row.addWidget(save_btn)
+        btn_row.addWidget(cancel_btn)
+        layout.addLayout(btn_row)
+
+        self.setLayout(layout)
+
+    def get_settings(self):
+        return {
+            "server_url": self.server_url_edit.text().strip(),
+            "channel": self.channel_combo.currentText().strip() or "stable",
+            "timeout_seconds": int(self.timeout_spin.value()),
+            "auto_check_on_startup": self.auto_check_check.isChecked(),
+        }
 
 
 class FindDialog(QDialog):

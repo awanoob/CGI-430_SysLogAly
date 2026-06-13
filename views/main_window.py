@@ -1,6 +1,21 @@
 """主窗口"""
-from PyQt6.QtCore import QPoint, Qt
-from PyQt6.QtGui import QAction, QBrush, QColor, QPen
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import webbrowser
+from pathlib import Path
+from urllib.error import URLError
+from urllib.parse import urljoin
+from urllib.request import urlopen
+
+from PyQt6.QtCore import QPoint, QSettings, QTimer, QUrl, Qt
+from PyQt6.QtGui import QAction, QBrush, QColor, QDesktopServices, QPen
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -24,10 +39,31 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from config import LOG_COLORS, MAX_FILTER_ITEMS_OTHER, MAX_FILTER_ITEMS_TIME, TABLE_HEADERS
+from config import (
+    APP_ID,
+    APP_VERSION,
+    LOG_COLORS,
+    MAX_FILTER_ITEMS_OTHER,
+    MAX_FILTER_ITEMS_TIME,
+    TABLE_HEADERS,
+    UPDATE_AUTO_CHECK_ON_STARTUP,
+    UPDATE_CHANNEL,
+    UPDATE_REQUEST_TIMEOUT,
+    UPDATE_SERVER_BASE_URL,
+    UPDATER_EXE_NAME,
+)
 from models import LogDatabase
 from utils import extract_version_info, parse_log_line, split_boot_sessions
-from views.dialogs import FilterDialog, FindDialog, RuleEditorDialog, QuickAddRuleDialog
+from views.dialogs import (
+    FilterDialog,
+    FilterHintDialog,
+    FindDialog,
+    InterfaceSettingsDialog,
+    NotificationSettingsDialog,
+    QuickAddRuleDialog,
+    RuleEditorDialog,
+    UpdateSettingsDialog,
+)
 
 
 class LogTreeItemDelegate(QStyledItemDelegate):
@@ -74,6 +110,7 @@ class LogViewer(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("系统日志分析工具")
+        self.settings = QSettings("CGI430", "SysLogAly")
 
         self.db = LogDatabase()
         self.db.connect()
@@ -93,9 +130,37 @@ class LogViewer(QMainWindow):
         self.suspend_sticky_updates = False
         self.rule_editor_dialog = None
         self.quick_add_dialog = None
+        self.current_file_path = ""
+
+        self.guide_prompts_enabled = self.settings.value("guide_prompts_enabled", True, type=bool)
+        self.filter_hint_suppressed = self.settings.value("filter_hint_suppressed", False, type=bool)
+        self.tree_bg_color = self.settings.value("tree_bg_color", "#ffffff", type=str)
+        self.update_server_url = self.settings.value(
+            "update_server_url",
+            UPDATE_SERVER_BASE_URL,
+            type=str,
+        )
+        self.update_channel = self.settings.value("update_channel", UPDATE_CHANNEL, type=str)
+        self.update_timeout_seconds = self.settings.value(
+            "update_timeout_seconds",
+            UPDATE_REQUEST_TIMEOUT,
+            type=int,
+        )
+        self.update_auto_check_on_startup = self.settings.value(
+            "update_auto_check_on_startup",
+            UPDATE_AUTO_CHECK_ON_STARTUP,
+            type=bool,
+        )
+        recent = self.settings.value("recent_files", [])
+        if isinstance(recent, str):
+            self.recent_files = [recent] if recent else []
+        else:
+            self.recent_files = list(recent) if recent else []
+        self.recent_files = [p for p in self.recent_files if p][:5]
 
         self.setAcceptDrops(True)
         self.init_ui()
+        self.check_unfinished_update_marker()
 
     def init_ui(self):
         self.create_menu()
@@ -112,13 +177,7 @@ class LogViewer(QMainWindow):
         self.tree.setUniformRowHeights(False)
         self.tree.setTextElideMode(Qt.TextElideMode.ElideNone)
         self.tree.setItemDelegate(LogTreeItemDelegate(self.tree))
-        self.tree.setStyleSheet(
-            "QHeaderView::section {"
-            " border-right: 1px solid #bdbdbd;"
-            " border-bottom: 1px solid #bdbdbd;"
-            " padding: 4px 6px;"
-            "}"
-        )
+        self.apply_tree_background_color(self.tree_bg_color, persist=False)
         self.tree.itemClicked.connect(self.show_log_detail)
         self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self.show_context_menu)
@@ -156,6 +215,9 @@ class LogViewer(QMainWindow):
         self.create_toolbar()
         self.create_status_bar()
 
+        if self.update_auto_check_on_startup:
+            QTimer.singleShot(1200, self.check_upgrade_silent)
+
     def create_menu(self):
         menubar = self.menuBar()
 
@@ -165,30 +227,59 @@ class LogViewer(QMainWindow):
         open_action.triggered.connect(self.open_file)
         file_menu.addAction(open_action)
 
-        edit_menu = menubar.addMenu("编辑")
+        self.open_folder_action = QAction("打开文件所在文件夹", self)
+        self.open_folder_action.triggered.connect(self.open_current_file_folder)
+        self.open_folder_action.setEnabled(False)
+        file_menu.addAction(self.open_folder_action)
+
+        self.recent_menu = file_menu.addMenu("最近文件")
+        self.recent_file_actions = []
+        for idx in range(5):
+            action = QAction("", self)
+            action.setVisible(False)
+            action.triggered.connect(lambda _checked=False, i=idx: self.open_recent_file(i))
+            self.recent_menu.addAction(action)
+            self.recent_file_actions.append(action)
+        self.update_recent_files_menu()
+
+        search_menu = menubar.addMenu("搜索")
         find_action = QAction("查找", self)
         find_action.setShortcut("Ctrl+F")
         find_action.triggered.connect(self.show_find_dialog)
-        edit_menu.addAction(find_action)
+        search_menu.addAction(find_action)
 
         copy_action = QAction("复制选中内容", self)
         copy_action.setShortcut("Ctrl+C")
         copy_action.triggered.connect(self.copy_selected_row)
-        edit_menu.addAction(copy_action)
+        search_menu.addAction(copy_action)
 
         filter_action = QAction("筛选", self)
         filter_action.setShortcut("Ctrl+Shift+F")
         filter_action.triggered.connect(self.show_filter_dialog)
-        edit_menu.addAction(filter_action)
-
-        self.edit_rules_action = QAction("日志解释配置", self)
-        self.edit_rules_action.triggered.connect(self.show_rule_editor)
-        edit_menu.addAction(self.edit_rules_action)
+        search_menu.addAction(filter_action)
 
         jump_date_action = QAction("按日期跳转", self)
         jump_date_action.setShortcut("Ctrl+J")
         jump_date_action.triggered.connect(self.jump_to_date)
-        edit_menu.addAction(jump_date_action)
+        search_menu.addAction(jump_date_action)
+
+        advanced_menu = menubar.addMenu("高级")
+        self.edit_rules_action = QAction("日志解释配置", self)
+        self.edit_rules_action.triggered.connect(self.show_rule_editor)
+        advanced_menu.addAction(self.edit_rules_action)
+
+        settings_menu = menubar.addMenu("设置")
+        notification_action = QAction("通知设置", self)
+        notification_action.triggered.connect(self.show_notification_settings)
+        settings_menu.addAction(notification_action)
+
+        interface_action = QAction("界面设置", self)
+        interface_action.triggered.connect(self.show_interface_settings)
+        settings_menu.addAction(interface_action)
+
+        update_settings_action = QAction("升级设置", self)
+        update_settings_action.triggered.connect(self.show_update_settings)
+        settings_menu.addAction(update_settings_action)
 
         view_menu = menubar.addMenu("视图")
         expand_all_action = QAction("展开全部上电日志", self)
@@ -207,7 +298,479 @@ class LogViewer(QMainWindow):
         collapse_by_date_action.triggered.connect(lambda: self.set_date_expanded(False))
         view_menu.addAction(collapse_by_date_action)
 
+        self.toggle_detail_action = QAction("显示日志详情窗口", self)
+        self.toggle_detail_action.setCheckable(True)
+        self.toggle_detail_action.setChecked(True)
+        self.toggle_detail_action.toggled.connect(self.toggle_log_detail_dock)
+        view_menu.addAction(self.toggle_detail_action)
+
+        help_menu = menubar.addMenu("？")
+
+        about_action = QAction("关于", self)
+        about_action.triggered.connect(self.show_about_info)
+        help_menu.addAction(about_action)
+
+        check_upgrade_action = QAction("检查升级", self)
+        check_upgrade_action.triggered.connect(self.check_upgrade)
+        help_menu.addAction(check_upgrade_action)
+
+        help_action = QAction("帮助", self)
+        help_action.triggered.connect(self.open_help_page)
+        help_menu.addAction(help_action)
+
         self.update_action_states()
+
+    def _build_tree_stylesheet(self, bg_color):
+        return (
+            f"QTreeWidget {{ background-color: {bg_color}; }}"
+            "QHeaderView::section {"
+            " border-right: 1px solid #bdbdbd;"
+            " border-bottom: 1px solid #bdbdbd;"
+            " padding: 4px 6px;"
+            "}"
+        )
+
+    def apply_tree_background_color(self, color_hex, persist=True):
+        """应用日志背景颜色。"""
+        if not color_hex:
+            color_hex = "#ffffff"
+        self.tree_bg_color = color_hex
+        if hasattr(self, "tree"):
+            self.tree.setStyleSheet(self._build_tree_stylesheet(self.tree_bg_color))
+        if persist:
+            self.settings.setValue("tree_bg_color", self.tree_bg_color)
+
+    def check_unfinished_update_marker(self):
+        """检测未完成升级标记，提示用户进行排障。"""
+        marker = self._runtime_base_dir() / "unfinished_update.json"
+        lock_file = self._runtime_base_dir() / "update.lock"
+        if not marker.exists():
+            return
+
+        marker_text = ""
+        try:
+            marker_text = marker.read_text(encoding="utf-8").strip()
+        except Exception:
+            marker_text = "(无法读取标记详情)"
+
+        lock_tip = "检测到 update.lock 仍存在。" if lock_file.exists() else "未检测到 update.lock。"
+        QMessageBox.warning(
+            self,
+            "升级恢复提示",
+            "检测到上次升级可能未完成。\n"
+            f"标记文件: {marker}\n"
+            f"{lock_tip}\n\n"
+            "如程序运行异常，请回滚 backup 目录后重试升级。\n\n"
+            f"标记内容:\n{marker_text}",
+        )
+
+    def show_about_info(self):
+        """关于信息入口。"""
+        QMessageBox.information(
+            self,
+            "关于",
+            f"系统日志分析工具\n\n应用标识: {APP_ID}\n当前版本: {APP_VERSION}",
+        )
+
+    @staticmethod
+    def _normalize_version(version):
+        nums = []
+        for token in re.split(r"[^0-9]+", str(version or "")):
+            if token:
+                nums.append(int(token))
+        return tuple(nums) if nums else (0,)
+
+    def _is_newer_version(self, remote_version):
+        return self._normalize_version(remote_version) > self._normalize_version(APP_VERSION)
+
+    @staticmethod
+    def _parse_sha256_text(raw_text):
+        match = re.search(r"([a-fA-F0-9]{64})", raw_text or "")
+        return match.group(1).lower() if match else ""
+
+    def _fetch_json(self, url):
+        with urlopen(url, timeout=max(3, int(self.update_timeout_seconds))) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+        return json.loads(raw)
+
+    def _fetch_text(self, url):
+        with urlopen(url, timeout=max(3, int(self.update_timeout_seconds))) as response:
+            return response.read().decode("utf-8", errors="replace")
+
+    def _default_manifest_url(self):
+        base = (self.update_server_url or UPDATE_SERVER_BASE_URL).rstrip("/") + "/"
+        channel = (self.update_channel or UPDATE_CHANNEL).strip() or UPDATE_CHANNEL
+        return urljoin(base, f"{APP_ID}/{channel}/latest.json")
+
+    @staticmethod
+    def _runtime_base_dir():
+        if getattr(sys, "frozen", False):
+            return Path(sys.executable).resolve().parent
+        return Path(__file__).resolve().parents[1]
+
+    @staticmethod
+    def _project_root_dir():
+        return Path(__file__).resolve().parents[1]
+
+    def _build_restart_command(self):
+        if getattr(sys, "frozen", False):
+            return [sys.executable]
+        return [sys.executable, str(self._project_root_dir() / "main.py")]
+
+    def _resolve_updater_command(self):
+        runtime_dir = self._runtime_base_dir()
+        updater_exe = runtime_dir / UPDATER_EXE_NAME
+        if updater_exe.exists():
+            return [str(updater_exe)], str(updater_exe)
+
+        updater_script = self._project_root_dir() / "updater.py"
+        if updater_script.exists():
+            return [sys.executable, str(updater_script)], str(updater_script)
+
+        return None, ""
+
+    def _prepare_temp_updater_command(self, cmd_prefix):
+        """将升级器复制到临时目录后再运行，避免占用应用目录文件。"""
+        runtime_dir = Path(tempfile.gettempdir()) / "cgi430_updater_runtime"
+        runtime_dir.mkdir(parents=True, exist_ok=True)
+        stamp = f"{os.getpid()}_{int(time.time())}"
+
+        if len(cmd_prefix) == 1:
+            source = Path(cmd_prefix[0])
+            target = runtime_dir / f"{source.stem}_{stamp}{source.suffix or '.exe'}"
+            shutil.copy2(source, target)
+            return [str(target)], str(target)
+
+        if len(cmd_prefix) == 2:
+            source = Path(cmd_prefix[1])
+            target = runtime_dir / f"{source.stem}_{stamp}{source.suffix or '.py'}"
+            shutil.copy2(source, target)
+            return [cmd_prefix[0], str(target)], str(target)
+
+        raise RuntimeError("升级器命令格式不支持")
+
+    def _launch_external_updater(self, zip_path, remote_version):
+        cmd_prefix, updater_path = self._resolve_updater_command()
+        if not cmd_prefix:
+            raise RuntimeError("未找到独立升级器，请确认同目录存在 updater.exe 或工程根目录存在 updater.py")
+
+        try:
+            launch_prefix, runtime_updater_path = self._prepare_temp_updater_command(cmd_prefix)
+        except Exception as e:
+            raise RuntimeError(f"复制临时升级器失败:\n{str(e)}") from e
+
+        task_dir = Path(tempfile.gettempdir()) / "cgi430_update_tasks"
+        task_dir.mkdir(parents=True, exist_ok=True)
+        task_file = task_dir / f"update_task_{os.getpid()}_{int(time.time())}.json"
+
+        payload = {
+            "app_id": APP_ID,
+            "pid": os.getpid(),
+            "target_version": remote_version,
+            "app_dir": str(self._runtime_base_dir()),
+            "zip_path": str(Path(zip_path).resolve()),
+            "restart_cmd": self._build_restart_command(),
+            "lock_file": "update.lock",
+            "unfinished_marker": "unfinished_update.json",
+            "backup_root": "back_up",
+            "cleanup_backup_on_success": True,
+            "updater_exec_path": runtime_updater_path,
+        }
+        task_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        launch_cmd = launch_prefix + ["--task-file", str(task_file)]
+        creation_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        try:
+            subprocess.Popen(launch_cmd, close_fds=True, creationflags=creation_flags)
+        except Exception as e:
+            try:
+                task_file.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise RuntimeError(
+                "启动临时升级器失败，请检查杀软拦截或目录权限。\n"
+                f"原升级器: {updater_path}\n"
+                f"临时升级器: {runtime_updater_path}\n"
+                f"错误: {str(e)}"
+            ) from e
+
+        return runtime_updater_path
+
+    def _download_with_progress(self, src_url, dst_path):
+        with urlopen(src_url, timeout=max(3, int(self.update_timeout_seconds))) as response:
+            total = int(response.headers.get("Content-Length", "0") or "0")
+            progress = QProgressDialog("正在下载升级包...", "取消", 0, 100, self)
+            progress.setWindowTitle("升级下载")
+            progress.setWindowModality(Qt.WindowModality.WindowModal)
+            progress.setMinimumDuration(0)
+            progress.setAutoClose(False)
+            progress.setAutoReset(False)
+            progress.show()
+
+            received = 0
+            cancelled = False
+            try:
+                with open(dst_path, "wb") as out:
+                    while True:
+                        chunk = response.read(1024 * 128)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                        received += len(chunk)
+                        if total > 0:
+                            percent = min(100, int(received * 100 / total))
+                            progress.setValue(percent)
+                            progress.setLabelText(f"正在下载升级包... {percent}%")
+                        else:
+                            progress.setLabelText(f"正在下载升级包... 已接收 {received} 字节")
+                        QApplication.processEvents()
+                        if progress.wasCanceled():
+                            cancelled = True
+                            break
+                if total > 0:
+                    progress.setValue(100)
+                QApplication.processEvents()
+            finally:
+                progress.close()
+
+        if cancelled:
+            try:
+                Path(dst_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise RuntimeError("用户取消下载")
+
+    @staticmethod
+    def _sha256_file(file_path):
+        digest = hashlib.sha256()
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest().lower()
+
+    def check_upgrade_silent(self):
+        """启动时静默检查升级（仅在发现新版本时提示）。"""
+        self.check_upgrade(interactive=False)
+
+    def check_upgrade(self, interactive=True):
+        """检查升级并支持下载升级包。"""
+        manifest_url = self._default_manifest_url()
+
+        try:
+            manifest = self._fetch_json(manifest_url)
+        except URLError as e:
+            if interactive:
+                QMessageBox.warning(self, "检查升级", f"无法连接升级服务器:\n{str(e)}")
+            return
+        except json.JSONDecodeError as e:
+            if interactive:
+                QMessageBox.warning(self, "检查升级", f"升级清单格式错误:\n{str(e)}")
+            return
+        except Exception as e:
+            if interactive:
+                QMessageBox.warning(self, "检查升级", f"读取升级清单失败:\n{str(e)}")
+            return
+
+        remote_version = str(manifest.get("version", "")).strip()
+        if not remote_version:
+            if interactive:
+                QMessageBox.warning(self, "检查升级", "升级清单缺少 version 字段")
+            return
+
+        force_upgrade = bool(manifest.get("force", False))
+        is_newer = self._is_newer_version(remote_version)
+        if not is_newer and not force_upgrade:
+            if interactive:
+                QMessageBox.information(
+                    self,
+                    "检查升级",
+                    f"当前已是最新版本\n\n当前版本: {APP_VERSION}\n服务器版本: {remote_version}",
+                )
+            return
+
+        package_url = str(manifest.get("url", "")).strip()
+        if not package_url:
+            if interactive:
+                QMessageBox.warning(self, "检查升级", "升级清单缺少 url 字段")
+            return
+
+        base_url = package_url.rsplit("/", 1)[0] + "/"
+        changelog_url = str(manifest.get("changelog_url", "")).strip() or urljoin(base_url, "changelog.txt")
+
+        expected_sha256 = str(manifest.get("sha256", "")).strip().lower()
+        sha256_text_url = str(manifest.get("sha256_url", "")).strip() or urljoin(base_url, "SHA256.txt")
+        if not expected_sha256:
+            try:
+                expected_sha256 = self._parse_sha256_text(self._fetch_text(sha256_text_url))
+            except Exception:
+                expected_sha256 = ""
+
+        changelog_text = ""
+        try:
+            changelog_text = self._fetch_text(changelog_url).strip()
+        except Exception:
+            changelog_text = "(未获取到 changelog.txt，可继续下载升级包)"
+
+        detail_lines = [
+            f"当前版本: {APP_VERSION}",
+            f"服务器版本: {remote_version}",
+            f"下载地址: {package_url}",
+        ]
+        if expected_sha256:
+            detail_lines.append(f"SHA256: {expected_sha256}")
+        if force_upgrade:
+            detail_lines.append("提示: 该版本为强制升级")
+        detail_lines.append("\n更新日志:\n" + changelog_text)
+
+        ask_text = "检测到可用更新，是否下载升级包？"
+        if not interactive:
+            ask_text = f"检测到新版本 {remote_version}，是否立即下载升级包？"
+
+        reply = QMessageBox.question(
+            self,
+            "检查升级",
+            ask_text,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            if interactive:
+                QMessageBox.information(self, "检查升级", "已取消下载\n\n" + "\n".join(detail_lines))
+            return
+
+        save_path = str(self._runtime_base_dir() / "app.zip")
+
+        try:
+            Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(save_path).unlink(missing_ok=True)
+            self._download_with_progress(package_url, save_path)
+            if expected_sha256:
+                actual_sha256 = self._sha256_file(save_path)
+                if actual_sha256 != expected_sha256:
+                    Path(save_path).unlink(missing_ok=True)
+                    QMessageBox.critical(
+                        self,
+                        "检查升级",
+                        "升级包校验失败，文件已删除。\n"
+                        f"期望: {expected_sha256}\n实际: {actual_sha256}",
+                    )
+                    return
+
+            verify_text = "SHA256 校验通过。\n" if expected_sha256 else "未获取 SHA256，已跳过校验。\n"
+            done_message = (
+                "升级包下载完成。\n\n"
+                f"保存路径: {save_path}\n"
+                f"{verify_text}"
+                "\n是否立即开始升级？（将启动独立升级器并关闭当前程序）"
+            )
+            do_upgrade = QMessageBox.question(
+                self,
+                "检查升级",
+                done_message,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if do_upgrade == QMessageBox.StandardButton.Yes:
+                updater_path = self._launch_external_updater(save_path, remote_version)
+                QMessageBox.information(
+                    self,
+                    "开始升级",
+                    "已启动独立升级器，将退出当前程序。\n\n"
+                    f"升级器: {updater_path}\n"
+                    "关闭后将自动执行文件替换并重启主程序。",
+                )
+                self.close()
+                return
+
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(save_path).parent)))
+        except Exception as e:
+            QMessageBox.critical(self, "检查升级", f"升级流程失败:\n{str(e)}")
+
+    def build_help_html(self):
+        """构建帮助文档 HTML 内容。"""
+        return """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>系统日志分析工具 - 使用说明</title>
+    <style>
+        body { font-family: "Microsoft YaHei", "PingFang SC", sans-serif; margin: 24px auto; max-width: 980px; line-height: 1.7; color: #1f2937; padding: 0 16px; }
+        h1, h2 { color: #0f172a; }
+        .card { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 14px 16px; margin: 12px 0; }
+        code { background: #eef2ff; padding: 2px 6px; border-radius: 6px; }
+        ul { margin-top: 6px; }
+    </style>
+</head>
+<body>
+    <h1>系统日志分析工具 使用说明</h1>
+
+    <div class="card">
+        <h2>1. 快速开始</h2>
+        <ul>
+            <li>点击菜单 <code>文件 -> 打开文件</code>，或直接拖拽日志文件到主窗口。</li>
+            <li>日志加载后按“上电分组”显示，可展开查看详细日志。</li>
+            <li>点击任一日志行，右侧“日志详情”会展示字段和解释信息。</li>
+        </ul>
+    </div>
+
+    <div class="card">
+        <h2>2. 搜索相关功能</h2>
+        <ul>
+            <li><code>搜索 -> 查找</code>：按关键字在可见日志中逐条向后查找。</li>
+            <li><code>搜索 -> 筛选</code>：按等级/模块/函数/内容过滤日志。</li>
+            <li><code>搜索 -> 按日期跳转</code>：输入日期快速定位日志。</li>
+            <li><code>搜索 -> 复制选中内容</code>：复制当前选中的日志行。</li>
+        </ul>
+    </div>
+
+    <div class="card">
+        <h2>3. 日志解释配置</h2>
+        <ul>
+            <li>通过 <code>高级 -> 日志解释配置</code> 管理解释规则。</li>
+            <li>支持静态解释文本与“日志解析代码”两种方式。</li>
+            <li>右键日志行可打开“新增/修改日志解释”，并支持脚本测试。</li>
+        </ul>
+    </div>
+
+    <div class="card">
+        <h2>4. 日志解析代码脚本规范</h2>
+        <ul>
+            <li>脚本必须定义函数：<code>explain(context)</code>。</li>
+            <li><code>context</code> 包含字段：<code>level/module/function/line_no/content/default_remark</code>。</li>
+            <li>脚本应返回字符串；匹配失败建议返回 <code>context['default_remark']</code>。</li>
+            <li>可使用 <code>re</code> 模块与已开放的安全内建函数（如 <code>map/range/list/sum</code> 等）。</li>
+        </ul>
+    </div>
+
+    <div class="card">
+        <h2>5. 其他说明</h2>
+        <ul>
+            <li>“检查升级”会读取内网升级清单、下载并校验更新包，然后启动独立升级器执行替换与重启。</li>
+            <li>可通过 <code>设置 -> 升级设置</code> 配置服务器地址、通道、超时和启动静默检查。</li>
+            <li>帮助页由程序运行时生成临时 HTML 文件并在浏览器打开。</li>
+        </ul>
+    </div>
+</body>
+</html>
+"""
+
+    def open_help_page(self):
+        """生成临时 HTML 帮助文档并在浏览器打开。"""
+        try:
+            html = self.build_help_html()
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                suffix="_cgi430_help.html",
+                delete=False,
+                encoding="utf-8",
+            ) as f:
+                f.write(html)
+                temp_path = f.name
+
+            webbrowser.open(Path(temp_path).as_uri())
+        except Exception as e:
+            QMessageBox.critical(self, "帮助", f"打开帮助文档失败:\n{str(e)}")
 
     def is_rule_editor_open(self):
         return self.rule_editor_dialog is not None and self.rule_editor_dialog.isVisible()
@@ -219,12 +782,115 @@ class LogViewer(QMainWindow):
         if hasattr(self, "edit_rules_action"):
             self.edit_rules_action.setEnabled(not self.is_quick_add_open())
 
+    def update_recent_files_menu(self):
+        """刷新最近文件菜单。"""
+        for idx, action in enumerate(self.recent_file_actions):
+            if idx < len(self.recent_files):
+                path = self.recent_files[idx]
+                action.setText(f"{idx + 1}. {path}")
+                action.setVisible(True)
+            else:
+                action.setVisible(False)
+
+    def add_recent_file(self, file_path):
+        """记录最近文件。"""
+        if not file_path:
+            return
+        path = str(Path(file_path))
+        self.recent_files = [p for p in self.recent_files if p != path]
+        self.recent_files.insert(0, path)
+        self.recent_files = self.recent_files[:5]
+        self.settings.setValue("recent_files", self.recent_files)
+        self.update_recent_files_menu()
+
+    def open_recent_file(self, index):
+        """打开最近文件。"""
+        if index >= len(self.recent_files):
+            return
+        path = self.recent_files[index]
+        if not Path(path).exists():
+            QMessageBox.warning(self, "最近文件", f"文件不存在:\n{path}")
+            self.recent_files.pop(index)
+            self.settings.setValue("recent_files", self.recent_files)
+            self.update_recent_files_menu()
+            return
+        self._load_file_path(path)
+
+    def open_current_file_folder(self):
+        """打开当前日志文件所在目录。"""
+        if not self.current_file_path:
+            QMessageBox.information(self, "打开目录", "当前没有已打开的日志文件")
+            return
+        folder = str(Path(self.current_file_path).parent)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+
+    def show_notification_settings(self):
+        """打开通知设置。"""
+        dialog = NotificationSettingsDialog(self.guide_prompts_enabled, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        settings = dialog.get_settings()
+        self.guide_prompts_enabled = settings["guide_enabled"]
+        self.settings.setValue("guide_prompts_enabled", self.guide_prompts_enabled)
+
+    def show_interface_settings(self):
+        """打开界面设置。"""
+        dialog = InterfaceSettingsDialog(self.tree_bg_color, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        settings = dialog.get_settings()
+        self.apply_tree_background_color(settings["tree_bg_color"], persist=True)
+
+    def show_update_settings(self):
+        """打开升级设置。"""
+        dialog = UpdateSettingsDialog(
+            server_url=self.update_server_url,
+            channel=self.update_channel,
+            timeout_seconds=self.update_timeout_seconds,
+            auto_check_on_startup=self.update_auto_check_on_startup,
+            parent=self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        settings = dialog.get_settings()
+        if not settings["server_url"]:
+            QMessageBox.warning(self, "升级设置", "升级服务器地址不能为空")
+            return
+
+        self.update_server_url = settings["server_url"].rstrip("/")
+        self.update_channel = settings["channel"]
+        self.update_timeout_seconds = settings["timeout_seconds"]
+        self.update_auto_check_on_startup = settings["auto_check_on_startup"]
+
+        self.settings.setValue("update_server_url", self.update_server_url)
+        self.settings.setValue("update_channel", self.update_channel)
+        self.settings.setValue("update_timeout_seconds", self.update_timeout_seconds)
+        self.settings.setValue("update_auto_check_on_startup", self.update_auto_check_on_startup)
+
+        QMessageBox.information(
+            self,
+            "升级设置",
+            "升级设置已保存。\n"
+            f"服务器: {self.update_server_url}\n"
+            f"通道: {self.update_channel}\n"
+            f"超时: {self.update_timeout_seconds}s\n"
+            f"启动自动检查: {'开启' if self.update_auto_check_on_startup else '关闭'}",
+        )
+
     def create_dock_widgets(self):
         self.log_detail = QTextEdit()
         self.log_detail.setReadOnly(True)
         self.detail_dock = QDockWidget("日志详情")
         self.detail_dock.setWidget(self.log_detail)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.detail_dock)
+        self.detail_dock.visibilityChanged.connect(self.on_detail_dock_visibility_changed)
+
+    def on_detail_dock_visibility_changed(self, visible):
+        if hasattr(self, "toggle_detail_action"):
+            self.toggle_detail_action.blockSignals(True)
+            self.toggle_detail_action.setChecked(bool(visible))
+            self.toggle_detail_action.blockSignals(False)
 
     def create_toolbar(self):
         toolbar = QToolBar("主工具栏", self)
@@ -272,6 +938,9 @@ class LogViewer(QMainWindow):
             return
 
         self.load_logs(lines)
+        self.current_file_path = file_path
+        self.add_recent_file(file_path)
+        self.open_folder_action.setEnabled(True)
         QMessageBox.information(self, "成功", f"成功加载 {len(lines)} 行日志")
 
     def dragEnterEvent(self, event):
@@ -430,6 +1099,13 @@ class LogViewer(QMainWindow):
         self.log_detail.setText(detail + "\n\n解释:\n" + remark)
 
     def show_filter_dialog(self):
+        if self.guide_prompts_enabled and not self.filter_hint_suppressed:
+            hint = FilterHintDialog(self)
+            hint.exec()
+            if hint.dont_show_again():
+                self.filter_hint_suppressed = True
+                self.settings.setValue("filter_hint_suppressed", True)
+
         dialog = FilterDialog(self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -485,9 +1161,77 @@ class LogViewer(QMainWindow):
             return False
         if self.current_filters["function"] and self.current_filters["function"].lower() not in row["function"].lower():
             return False
-        if self.current_filters["content"] and self.current_filters["content"].lower() not in row["content"].lower():
+        if self.current_filters["content"] and not self.match_content_expression(
+            self.current_filters["content"], row["content"]
+        ):
             return False
         return True
+
+    def _tokenize_filter_expression(self, expression):
+        tokens = []
+        buf = []
+        in_quote = False
+        i = 0
+        while i < len(expression):
+            ch = expression[i]
+            if ch == '"':
+                in_quote = not in_quote
+                i += 1
+                continue
+            if not in_quote and i + 1 < len(expression) and expression[i:i + 2] in ("&&", "||"):
+                token = "".join(buf).strip()
+                if token:
+                    tokens.append(token)
+                tokens.append(expression[i:i + 2])
+                buf = []
+                i += 2
+                continue
+            if not in_quote and ch.isspace():
+                token = "".join(buf).strip()
+                if token:
+                    tokens.append(token)
+                buf = []
+                i += 1
+                continue
+            buf.append(ch)
+            i += 1
+
+        token = "".join(buf).strip()
+        if token:
+            tokens.append(token)
+        return tokens
+
+    def match_content_expression(self, expression, content):
+        tokens = self._tokenize_filter_expression(expression)
+        if not tokens:
+            return True
+
+        normalized = []
+        prev_is_term = False
+        for tok in tokens:
+            is_op = tok in ("&&", "||")
+            if not is_op and prev_is_term:
+                normalized.append("||")
+            normalized.append(tok)
+            prev_is_term = not is_op
+
+        if normalized[0] in ("&&", "||") or normalized[-1] in ("&&", "||"):
+            return expression.lower() in content.lower()
+
+        groups = [[]]
+        for tok in normalized:
+            if tok == "||":
+                groups.append([])
+            elif tok == "&&":
+                continue
+            else:
+                groups[-1].append(tok.lower())
+
+        target = content.lower()
+        for group in groups:
+            if group and all(term in target for term in group):
+                return True
+        return False
 
     def show_find_dialog(self):
         dialog = FindDialog(self)
@@ -652,6 +1396,10 @@ class LogViewer(QMainWindow):
         menu.addAction(clear_filter_action)
 
         menu.exec(self.tree.viewport().mapToGlobal(pos))
+
+    def toggle_log_detail_dock(self, checked):
+        if hasattr(self, "detail_dock"):
+            self.detail_dock.setVisible(bool(checked))
 
     def copy_selected_row(self):
         from PyQt6.QtWidgets import QApplication
